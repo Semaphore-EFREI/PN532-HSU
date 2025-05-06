@@ -9,7 +9,7 @@
 #include "emulatetag.h"
 #include "PN532_debug.h"
 
-#include <string.h>
+// #include <string.h>
 
 #define MAX_TGREAD
 
@@ -75,7 +75,7 @@ bool EmulateTag::emulate(const uint16_t tgInitAsTargetTimeout){
 
     uint8_t command[] = {
         PN532_COMMAND_TGINITASTARGET,
-        5,                  // MODE: PICC only, Passive only
+        5,                  // MODE: PICC only | Passive only
 
         0x04, 0x00,         // SENS_RES
         0x00, 0x00, 0x00,   // NFCID1

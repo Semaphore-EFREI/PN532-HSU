@@ -1,7 +1,5 @@
 
 #include "PN532_HSU.h"
-#include "PN532_debug.h"
-
 
 PN532_HSU::PN532_HSU(HardwareSerial &serial)
 {
