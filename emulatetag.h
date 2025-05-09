@@ -26,7 +26,7 @@ typedef enum {
 class EmulateTag {
 
 public:
-  EmulateTag(PN532Interface &interface)
+  EmulateTag(PN532 &interface)
       : pn532(interface), uidPtr(0), tagWrittenByInitiator(false),
         tagWriteable(true), updateNdefCallback(0) {}
 

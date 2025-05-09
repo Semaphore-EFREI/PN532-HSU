@@ -6,16 +6,13 @@
 */
 /**************************************************************************/
 
-#include "Arduino.h"
 #include "PN532.h"
-#include "PN532_debug.h"
 // #include <string.h>
 
-#define HAL(func)   (_interface->func)
-
-PN532::PN532(PN532Interface &interface)
+PN532::PN532(HardwareSerial &serial)
 {
-    _interface = &interface;
+    _serial = &serial;
+    command = 0;
 }
 
 /**************************************************************************/
@@ -25,9 +22,186 @@ PN532::PN532(PN532Interface &interface)
 /**************************************************************************/
 void PN532::begin()
 {
-    HAL(begin)();
-    HAL(wakeup)();
+    _serial->begin(115200);
+    _serial->write(0x55);
+    _serial->write(0x55);
+    _serial->write(0);
+    _serial->write(0);
+    _serial->write(0);
+
+    /** dump serial buffer */
+    if(_serial->available()){
+        Serial.print("Dump serial buffer: ");
+    }
+    while(_serial->available()){
+        uint8_t ret = _serial->read();
+        Serial.print(ret);
+    }
 }
+
+
+int8_t PN532::writeCommand(const uint8_t *header, uint8_t hlen, const uint8_t *body, uint8_t blen)
+{
+
+    /** dump serial buffer */
+    if(_serial->available()){
+        Serial.print("Dump serial buffer: ");
+    }
+    while(_serial->available()){
+        uint8_t ret = _serial->read();
+        Serial.print(ret);
+    }
+
+    command = header[0];
+    
+    _serial->write(PN532_PREAMBLE);
+    _serial->write(PN532_STARTCODE1);
+    _serial->write(PN532_STARTCODE2);
+    
+    uint8_t length = hlen + blen + 1;   // length of data field: TFI + DATA
+    _serial->write(length);
+    _serial->write(~length + 1);         // checksum of length
+    
+    _serial->write(PN532_HOSTTOPN532);
+    uint8_t sum = PN532_HOSTTOPN532;    // sum of TFI + DATA
+
+    Serial.print("\nWrite: ");
+    
+    _serial->write(header, hlen);
+    for (uint8_t i = 0; i < hlen; i++) {
+        sum += header[i];
+
+        Serial.print(header[i]);
+    }
+
+    _serial->write(body, blen);
+    for (uint8_t i = 0; i < blen; i++) {
+        sum += body[i];
+
+        Serial.print(body[i]);
+    }
+    
+    uint8_t checksum = ~sum + 1;            // checksum of TFI + DATA
+    _serial->write(checksum);
+    _serial->write(PN532_POSTAMBLE);
+
+    return readAckFrame();
+}
+
+int16_t PN532::readResponse(uint8_t buf[], uint8_t len, uint16_t timeout)
+{
+    uint8_t tmp[3];
+    
+    Serial.print("\nRead:  ");
+    
+    /** Frame Preamble and Start Code */
+    if(receive(tmp, 3, timeout)<=0){
+        return PN532_TIMEOUT;
+    }
+    if(0 != tmp[0] || 0!= tmp[1] || 0xFF != tmp[2]){
+        Serial.print("Preamble error");
+        return PN532_INVALID_FRAME;
+    }
+    
+    /** receive length and check */
+    uint8_t length[2];
+    if(receive(length, 2, timeout) <= 0){
+        return PN532_TIMEOUT;
+    }
+    if( 0 != (uint8_t)(length[0] + length[1]) ){
+        Serial.print("Length error");
+        return PN532_INVALID_FRAME;
+    }
+    length[0] -= 2;
+    if( length[0] > len){
+        return PN532_NO_SPACE;
+    }
+    
+    /** receive command byte */
+    uint8_t cmd = command + 1;               // response command
+    if(receive(tmp, 2, timeout) <= 0){
+        return PN532_TIMEOUT;
+    }
+    if( PN532_PN532TOHOST != tmp[0] || cmd != tmp[1]){
+        Serial.print("Command error");
+        return PN532_INVALID_FRAME;
+    }
+    
+    if(receive(buf, length[0], timeout) != length[0]){
+        return PN532_TIMEOUT;
+    }
+    uint8_t sum = PN532_PN532TOHOST + cmd;
+    for(uint8_t i=0; i<length[0]; i++){
+        sum += buf[i];
+    }
+    
+    /** checksum and postamble */
+    if(receive(tmp, 2, timeout) <= 0){
+        return PN532_TIMEOUT;
+    }
+    if( 0 != (uint8_t)(sum + tmp[0]) || 0 != tmp[1] ){
+        Serial.print("Checksum error");
+        return PN532_INVALID_FRAME;
+    }
+    
+    return length[0];
+}
+
+int8_t PN532::readAckFrame()
+{
+    const uint8_t PN532_ACK[] = {0, 0, 0xFF, 0, 0xFF, 0};
+    uint8_t ackBuf[sizeof(PN532_ACK)];
+    
+    Serial.print("\nAck: ");
+    
+    if( receive(ackBuf, sizeof(PN532_ACK), PN532_ACK_WAIT_TIME) <= 0 ){
+        Serial.print("Timeout\n");
+        return PN532_TIMEOUT;
+    }
+    
+    if( memcmp(ackBuf, PN532_ACK, sizeof(PN532_ACK)) ){
+        Serial.print("Invalid\n");
+        return PN532_INVALID_ACK;
+    }
+    return 0;
+}
+
+/**
+    @brief receive data .
+    @param buf --> return value buffer.
+           len --> length expect to receive.
+           timeout --> time of reveiving
+    @retval number of received bytes, 0 means no data received.
+*/
+int8_t PN532::receive(uint8_t *buf, int len, uint16_t timeout)
+{
+  int read_bytes = 0;
+  int ret;
+  unsigned long start_millis;
+  
+  while (read_bytes < len) {
+    start_millis = millis();
+    do {
+      ret = _serial->read();
+      if (ret >= 0) {
+        break;
+     }
+    } while((timeout == 0) || ((millis()- start_millis ) < timeout));
+    
+    if (ret < 0) {
+        if(read_bytes){
+            return read_bytes;
+        }else{
+            return PN532_TIMEOUT;
+        }
+    }
+    buf[read_bytes] = (uint8_t)ret;
+    Serial.print(ret);
+    read_bytes++;
+  }
+  return read_bytes;
+}
+
 
 /**************************************************************************/
 /*!
@@ -119,12 +293,12 @@ uint32_t PN532::getFirmwareVersion(void)
 
     pn532_packetbuffer[0] = PN532_COMMAND_GETFIRMWAREVERSION;
 
-    if (HAL(writeCommand)(pn532_packetbuffer, 1)) {
+    if (writeCommand(pn532_packetbuffer, 1)) {
         return 0;
     }
 
     // read data packet
-    int16_t status = HAL(readResponse)(pn532_packetbuffer, sizeof(pn532_packetbuffer));
+    int16_t status = readResponse(pn532_packetbuffer, sizeof(pn532_packetbuffer));
     if (0 > status) {
         return 0;
     }
@@ -158,12 +332,12 @@ uint32_t PN532::readRegister(uint16_t reg)
     pn532_packetbuffer[1] = (reg >> 8) & 0xFF;
     pn532_packetbuffer[2] = reg & 0xFF;
 
-    if (HAL(writeCommand)(pn532_packetbuffer, 3)) {
+    if (writeCommand(pn532_packetbuffer, 3)) {
         return 0;
     }
 
     // read data packet
-    int16_t status = HAL(readResponse)(pn532_packetbuffer, sizeof(pn532_packetbuffer));
+    int16_t status = readResponse(pn532_packetbuffer, sizeof(pn532_packetbuffer));
     if (0 > status) {
         return 0;
     }
@@ -193,12 +367,12 @@ uint32_t PN532::writeRegister(uint16_t reg, uint8_t val)
     pn532_packetbuffer[3] = val;
 
 
-    if (HAL(writeCommand)(pn532_packetbuffer, 4)) {
+    if (writeCommand(pn532_packetbuffer, 4)) {
         return 0;
     }
 
     // read data packet
-    int16_t status = HAL(readResponse)(pn532_packetbuffer, sizeof(pn532_packetbuffer));
+    int16_t status = readResponse(pn532_packetbuffer, sizeof(pn532_packetbuffer));
     if (0 > status) {
         return 0;
     }
@@ -237,15 +411,15 @@ bool PN532::writeGPIO(uint8_t pinstate)
     pn532_packetbuffer[1] = PN532_GPIO_VALIDATIONBIT | pinstate;  // P3 Pins
     pn532_packetbuffer[2] = 0x00;    // P7 GPIO Pins (not used ... taken by I2C)
 
-    DMSG("Writing P3 GPIO: ");
-    DMSG_HEX(pn532_packetbuffer[1]);
-    DMSG("\n");
+    Serial.print("Writing P3 GPIO: ");
+    Serial.print(pn532_packetbuffer[1]);
+    Serial.print("\n");
 
     // Send the WRITEGPIO command (0x0E)
-    if (HAL(writeCommand)(pn532_packetbuffer, 3))
+    if (writeCommand(pn532_packetbuffer, 3))
         return 0;
 
-    return (0 < HAL(readResponse)(pn532_packetbuffer, sizeof(pn532_packetbuffer)));
+    return (0 < readResponse(pn532_packetbuffer, sizeof(pn532_packetbuffer)));
 }
 
 /**************************************************************************/
@@ -267,10 +441,10 @@ uint8_t PN532::readGPIO(void)
     pn532_packetbuffer[0] = PN532_COMMAND_READGPIO;
 
     // Send the READGPIO command (0x0C)
-    if (HAL(writeCommand)(pn532_packetbuffer, 1))
+    if (writeCommand(pn532_packetbuffer, 1))
         return 0x0;
 
-    HAL(readResponse)(pn532_packetbuffer, sizeof(pn532_packetbuffer));
+    readResponse(pn532_packetbuffer, sizeof(pn532_packetbuffer));
 
     /* READGPIO response without prefix and suffix should be in the following format:
 
@@ -282,10 +456,10 @@ uint8_t PN532::readGPIO(void)
     */
 
 
-    DMSG("P3 GPIO: "); DMSG_HEX(pn532_packetbuffer[7]);
-    DMSG("P7 GPIO: "); DMSG_HEX(pn532_packetbuffer[8]);
-    DMSG("I0I1 GPIO: "); DMSG_HEX(pn532_packetbuffer[9]);
-    DMSG("\n");
+    Serial.print("P3 GPIO: "); Serial.print(pn532_packetbuffer[7]);
+    Serial.print("P7 GPIO: "); Serial.print(pn532_packetbuffer[8]);
+    Serial.print("I0I1 GPIO: "); Serial.print(pn532_packetbuffer[9]);
+    Serial.print("\n");
 
     return pn532_packetbuffer[0];
 }
@@ -302,12 +476,12 @@ bool PN532::SAMConfig(void)
     pn532_packetbuffer[2] = 0x14; // timeout 50ms * 20 = 1 second
     pn532_packetbuffer[3] = 0x01; // use IRQ pin!
 
-    DMSG("SAMConfig\n");
+    Serial.print("SAMConfig\n");
 
-    if (HAL(writeCommand)(pn532_packetbuffer, 4))
+    if (writeCommand(pn532_packetbuffer, 4))
         return false;
 
-    return (0 < HAL(readResponse)(pn532_packetbuffer, sizeof(pn532_packetbuffer)));
+    return (0 < readResponse(pn532_packetbuffer, sizeof(pn532_packetbuffer)));
 }
 
 /**************************************************************************/
@@ -328,10 +502,10 @@ bool PN532::setPassiveActivationRetries(uint8_t maxRetries)
     pn532_packetbuffer[3] = 0x01; // MxRtyPSL (default = 0x01)
     pn532_packetbuffer[4] = maxRetries;
 
-    if (HAL(writeCommand)(pn532_packetbuffer, 5))
+    if (writeCommand(pn532_packetbuffer, 5))
         return 0x0;  // no ACK
 
-    return (0 < HAL(readResponse)(pn532_packetbuffer, sizeof(pn532_packetbuffer)));
+    return (0 < readResponse(pn532_packetbuffer, sizeof(pn532_packetbuffer)));
 }
 
 /**************************************************************************/
@@ -357,11 +531,11 @@ bool PN532::setRFField(uint8_t autoRFCA, uint8_t rFOnOff)
     pn532_packetbuffer[1] = 1;
     pn532_packetbuffer[2] = 0x00 | autoRFCA | rFOnOff;  
 
-    if (HAL(writeCommand)(pn532_packetbuffer, 3)) {
+    if (writeCommand(pn532_packetbuffer, 3)) {
         return 0x0;  // command failed
     }
 
-    return (0 < HAL(readResponse)(pn532_packetbuffer, sizeof(pn532_packetbuffer)));
+    return (0 < readResponse(pn532_packetbuffer, sizeof(pn532_packetbuffer)));
 }
 
 /***** ISO14443A Commands ******/
@@ -385,12 +559,12 @@ bool PN532::readPassiveTargetID(uint8_t cardbaudrate, uint8_t *uid, uint8_t *uid
     pn532_packetbuffer[1] = 1;  // max 1 cards at once (we can set this to 2 later)
     pn532_packetbuffer[2] = cardbaudrate;
 
-    if (HAL(writeCommand)(pn532_packetbuffer, 3)) {
+    if (writeCommand(pn532_packetbuffer, 3)) {
         return 0x0;  // command failed
     }
 
     // read data packet
-    if (HAL(readResponse)(pn532_packetbuffer, sizeof(pn532_packetbuffer), timeout) < 0) {
+    if (readResponse(pn532_packetbuffer, sizeof(pn532_packetbuffer), timeout) < 0) {
         return 0x0;
     }
 
@@ -414,9 +588,9 @@ bool PN532::readPassiveTargetID(uint8_t cardbaudrate, uint8_t *uid, uint8_t *uid
     sens_res <<= 8;
     sens_res |= pn532_packetbuffer[3];
 
-    DMSG("ATQA: 0x");  DMSG_HEX(sens_res);
-    DMSG("SAK: 0x");  DMSG_HEX(pn532_packetbuffer[4]);
-    DMSG("\n");
+    Serial.print("ATQA: 0x");  Serial.print(sens_res);
+    Serial.print("SAK: 0x");  Serial.print(pn532_packetbuffer[4]);
+    Serial.print("\n");
 
     /* Card appears to be Mifare Classic */
     *uidLength = pn532_packetbuffer[5];
@@ -498,17 +672,17 @@ uint8_t PN532::mifareclassic_AuthenticateBlock (uint8_t *uid, uint8_t uidLen, ui
         pn532_packetbuffer[10 + i] = _uid[i];              /* 4 bytes card ID */
     }
 
-    if (HAL(writeCommand)(pn532_packetbuffer, 10 + _uidLen))
+    if (writeCommand(pn532_packetbuffer, 10 + _uidLen))
         return 0;
 
     // Read the response packet
-    HAL(readResponse)(pn532_packetbuffer, sizeof(pn532_packetbuffer));
+    readResponse(pn532_packetbuffer, sizeof(pn532_packetbuffer));
 
     // Check if the response is valid and we are authenticated???
     // for an auth success it should be bytes 5-7: 0xD5 0x41 0x00
     // Mifare auth error is technically byte 7: 0x14 but anything other and 0x00 is not good
     if (pn532_packetbuffer[0] != 0x00) {
-        DMSG("Authentification failed\n");
+        Serial.print("Authentification failed\n");
         return 0;
     }
 
@@ -530,8 +704,8 @@ uint8_t PN532::mifareclassic_AuthenticateBlock (uint8_t *uid, uint8_t uidLen, ui
 /**************************************************************************/
 uint8_t PN532::mifareclassic_ReadDataBlock (uint8_t blockNumber, uint8_t *data)
 {
-    DMSG("Trying to read 16 bytes from block ");
-    DMSG_INT(blockNumber);
+    Serial.print("Trying to read 16 bytes from block ");
+    Serial.print(blockNumber);
 
     /* Prepare the command */
     pn532_packetbuffer[0] = PN532_COMMAND_INDATAEXCHANGE;
@@ -540,12 +714,12 @@ uint8_t PN532::mifareclassic_ReadDataBlock (uint8_t blockNumber, uint8_t *data)
     pn532_packetbuffer[3] = blockNumber;            /* Block Number (0..63 for 1K, 0..255 for 4K) */
 
     /* Send the command */
-    if (HAL(writeCommand)(pn532_packetbuffer, 4)) {
+    if (writeCommand(pn532_packetbuffer, 4)) {
         return 0;
     }
 
     /* Read the response packet */
-    HAL(readResponse)(pn532_packetbuffer, sizeof(pn532_packetbuffer));
+    readResponse(pn532_packetbuffer, sizeof(pn532_packetbuffer));
 
     /* If byte 8 isn't 0x00 we probably have an error */
     if (pn532_packetbuffer[0] != 0x00) {
@@ -581,12 +755,12 @@ uint8_t PN532::mifareclassic_WriteDataBlock (uint8_t blockNumber, uint8_t *data)
     memcpy (pn532_packetbuffer + 4, data, 16);        /* Data Payload */
 
     /* Send the command */
-    if (HAL(writeCommand)(pn532_packetbuffer, 20)) {
+    if (writeCommand(pn532_packetbuffer, 20)) {
         return 0;
     }
 
     /* Read the response packet */
-    return (0 < HAL(readResponse)(pn532_packetbuffer, sizeof(pn532_packetbuffer)));
+    return (0 < readResponse(pn532_packetbuffer, sizeof(pn532_packetbuffer)));
 }
 
 /**************************************************************************/
@@ -711,7 +885,7 @@ uint8_t PN532::mifareclassic_WriteNDEFURI (uint8_t sectorNumber, uint8_t uriIden
 uint8_t PN532::mifareultralight_ReadPage (uint8_t page, uint8_t *buffer)
 {
     if (page >= 64) {
-        DMSG("Page value out of range\n");
+        Serial.print("Page value out of range\n");
         return 0;
     }
 
@@ -722,12 +896,12 @@ uint8_t PN532::mifareultralight_ReadPage (uint8_t page, uint8_t *buffer)
     pn532_packetbuffer[3] = page;                /* Page Number (0..63 in most cases) */
 
     /* Send the command */
-    if (HAL(writeCommand)(pn532_packetbuffer, 4)) {
+    if (writeCommand(pn532_packetbuffer, 4)) {
         return 0;
     }
 
     /* Read the response packet */
-    HAL(readResponse)(pn532_packetbuffer, sizeof(pn532_packetbuffer));
+    readResponse(pn532_packetbuffer, sizeof(pn532_packetbuffer));
 
     /* If byte 8 isn't 0x00 we probably have an error */
     if (pn532_packetbuffer[0] == 0x00) {
@@ -766,12 +940,12 @@ uint8_t PN532::mifareultralight_WritePage (uint8_t page, uint8_t *buffer)
     memcpy (pn532_packetbuffer + 4, buffer, 4);          /* Data Payload */
 
     /* Send the command */
-    if (HAL(writeCommand)(pn532_packetbuffer, 8)) {
+    if (writeCommand(pn532_packetbuffer, 8)) {
         return 0;
     }
 
     /* Read the response packet */
-    return (0 < HAL(readResponse)(pn532_packetbuffer, sizeof(pn532_packetbuffer)));
+    return (0 < readResponse(pn532_packetbuffer, sizeof(pn532_packetbuffer)));
 }
 
 /**************************************************************************/
@@ -791,17 +965,17 @@ bool PN532::inDataExchange(uint8_t *send, uint8_t sendLength, uint8_t *response,
     pn532_packetbuffer[0] = 0x40; // PN532_COMMAND_INDATAEXCHANGE;
     pn532_packetbuffer[1] = inListedTag;
 
-    if (HAL(writeCommand)(pn532_packetbuffer, 2, send, sendLength)) {
+    if (writeCommand(pn532_packetbuffer, 2, send, sendLength)) {
         return false;
     }
 
-    int16_t status = HAL(readResponse)(response, *responseLength, 1000);
+    int16_t status = readResponse(response, *responseLength, 1000);
     if (status < 0) {
         return false;
     }
 
     if ((response[0] & 0x3f) != 0) {
-        DMSG("Status code indicates an error\n");
+        Serial.print("Status code indicates an error\n");
         return false;
     }
 
@@ -832,13 +1006,13 @@ bool PN532::inListPassiveTarget()
     pn532_packetbuffer[1] = 1;
     pn532_packetbuffer[2] = 0;
 
-    DMSG("inList passive target\n");
+    Serial.print("inList passive target\n");
 
-    if (HAL(writeCommand)(pn532_packetbuffer, 3)) {
+    if (writeCommand(pn532_packetbuffer, 3)) {
         return false;
     }
 
-    int16_t status = HAL(readResponse)(pn532_packetbuffer, sizeof(pn532_packetbuffer), 30000);
+    int16_t status = readResponse(pn532_packetbuffer, sizeof(pn532_packetbuffer), 30000);
     if (status < 0) {
         return false;
     }
@@ -854,12 +1028,12 @@ bool PN532::inListPassiveTarget()
 
 int8_t PN532::tgInitAsTarget(const uint8_t* command, const uint8_t len, const uint16_t timeout){
   
-  int8_t status = HAL(writeCommand)(command, len);
+  int8_t status = writeCommand(command, len);
     if (status < 0) {
         return -1;
     }
 
-    status = HAL(readResponse)(pn532_packetbuffer, sizeof(pn532_packetbuffer), timeout);
+    status = readResponse(pn532_packetbuffer, sizeof(pn532_packetbuffer), timeout);
     if (status > 0) {
         return 1;
     } else if (PN532_TIMEOUT == status) {
@@ -896,11 +1070,11 @@ int16_t PN532::tgGetData(uint8_t *buf, uint8_t len)
 {
     buf[0] = PN532_COMMAND_TGGETDATA;
 
-    if (HAL(writeCommand)(buf, 1)) {
+    if (writeCommand(buf, 1)) {
         return -1;
     }
 
-    int16_t status = HAL(readResponse)(buf, len, 3000);
+    int16_t status = readResponse(buf, len, 3000);
     if (0 >= status) {
         return status;
     }
@@ -909,7 +1083,7 @@ int16_t PN532::tgGetData(uint8_t *buf, uint8_t len)
 
 
     if (buf[0] != 0) {
-        DMSG("status is not ok\n");
+        Serial.print("status is not ok\n");
         return -5;
     }
 
@@ -924,12 +1098,12 @@ bool PN532::tgSetData(const uint8_t *header, uint8_t hlen, const uint8_t *body, 
 {
     if (hlen > (sizeof(pn532_packetbuffer) - 1)) {
         if ((body != 0) || (header == pn532_packetbuffer)) {
-            DMSG("tgSetData:buffer too small\n");
+            Serial.print("tgSetData:buffer too small\n");
             return false;
         }
 
         pn532_packetbuffer[0] = PN532_COMMAND_TGSETDATA;
-        if (HAL(writeCommand)(pn532_packetbuffer, 1, header, hlen)) {
+        if (writeCommand(pn532_packetbuffer, 1, header, hlen)) {
             return false;
         }
     } else {
@@ -938,12 +1112,12 @@ bool PN532::tgSetData(const uint8_t *header, uint8_t hlen, const uint8_t *body, 
         }
         pn532_packetbuffer[0] = PN532_COMMAND_TGSETDATA;
 
-        if (HAL(writeCommand)(pn532_packetbuffer, hlen + 1, body, blen)) {
+        if (writeCommand(pn532_packetbuffer, hlen + 1, body, blen)) {
             return false;
         }
     }
 
-    if (0 > HAL(readResponse)(pn532_packetbuffer, sizeof(pn532_packetbuffer), 3000)) {
+    if (0 > readResponse(pn532_packetbuffer, sizeof(pn532_packetbuffer), 3000)) {
         return false;
     }
 
@@ -959,12 +1133,12 @@ int16_t PN532::inRelease(const uint8_t relevantTarget){
     pn532_packetbuffer[0] = PN532_COMMAND_INRELEASE;
     pn532_packetbuffer[1] = relevantTarget;
 
-    if (HAL(writeCommand)(pn532_packetbuffer, 2)) {
+    if (writeCommand(pn532_packetbuffer, 2)) {
         return 0;
     }
 
     // read data packet
-    return HAL(readResponse)(pn532_packetbuffer, sizeof(pn532_packetbuffer));
+    return readResponse(pn532_packetbuffer, sizeof(pn532_packetbuffer));
 }
 
 
@@ -998,37 +1172,37 @@ int8_t PN532::felica_Polling(uint16_t systemCode, uint8_t requestCode, uint8_t *
   pn532_packetbuffer[6] = requestCode;
   pn532_packetbuffer[7] = 0;
 
-  if (HAL(writeCommand)(pn532_packetbuffer, 8)) {
-    DMSG("Could not send Polling command\n");
+  if (writeCommand(pn532_packetbuffer, 8)) {
+    Serial.print("Could not send Polling command\n");
     return -1;
   }
 
-  int16_t status = HAL(readResponse)(pn532_packetbuffer, 22, timeout);
+  int16_t status = readResponse(pn532_packetbuffer, 22, timeout);
   if (status < 0) {
-    DMSG("Could not receive response\n");
+    Serial.print("Could not receive response\n");
     return -2;
   }
 
   // Check NbTg (pn532_packetbuffer[7])
   if (pn532_packetbuffer[0] == 0) {
-    DMSG("No card had detected\n");
+    Serial.print("No card had detected\n");
     return 0;
   } else if (pn532_packetbuffer[0] != 1) {
-    DMSG("Unhandled number of targets inlisted. NbTg: ");
-    DMSG_HEX(pn532_packetbuffer[7]);
-    DMSG("\n");
+    Serial.print("Unhandled number of targets inlisted. NbTg: ");
+    Serial.print(pn532_packetbuffer[7]);
+    Serial.print("\n");
     return -3;
   }
 
   inListedTag = pn532_packetbuffer[1];
-  DMSG("Tag number: ");
-  DMSG_HEX(pn532_packetbuffer[1]);
-  DMSG("\n");
+  Serial.print("Tag number: ");
+  Serial.print(pn532_packetbuffer[1]);
+  Serial.print("\n");
 
   // length check
   uint8_t responseLength = pn532_packetbuffer[2];
   if (responseLength != 18 && responseLength != 20) {
-    DMSG("Wrong response length\n");
+    Serial.print("Wrong response length\n");
     return -4;
   }
 
@@ -1062,7 +1236,7 @@ int8_t PN532::felica_Polling(uint16_t systemCode, uint8_t requestCode, uint8_t *
 int8_t PN532::felica_SendCommand (const uint8_t *command, uint8_t commandlength, uint8_t *response, uint8_t *responseLength)
 {
   if (commandlength > 0xFE) {
-    DMSG("Command length too long\n");
+    Serial.print("Command length too long\n");
     return -1;
   }
 
@@ -1070,30 +1244,30 @@ int8_t PN532::felica_SendCommand (const uint8_t *command, uint8_t commandlength,
   pn532_packetbuffer[1] = inListedTag;
   pn532_packetbuffer[2] = commandlength + 1;
 
-  if (HAL(writeCommand)(pn532_packetbuffer, 3, command, commandlength)) {
-    DMSG("Could not send FeliCa command\n");
+  if (writeCommand(pn532_packetbuffer, 3, command, commandlength)) {
+    Serial.print("Could not send FeliCa command\n");
     return -2;
   }
 
   // Wait card response
-  int16_t status = HAL(readResponse)(pn532_packetbuffer, sizeof(pn532_packetbuffer), 200);
+  int16_t status = readResponse(pn532_packetbuffer, sizeof(pn532_packetbuffer), 200);
   if (status < 0) {
-    DMSG("Could not receive response\n");
+    Serial.print("Could not receive response\n");
     return -3;
   }
 
   // Check status (pn532_packetbuffer[0])
   if ((pn532_packetbuffer[0] & 0x3F)!=0) {
-    DMSG("Status code indicates an error: ");
-    DMSG_HEX(pn532_packetbuffer[0]);
-    DMSG("\n");
+    Serial.print("Status code indicates an error: ");
+    Serial.print(pn532_packetbuffer[0]);
+    Serial.print("\n");
     return -4;
   }
 
   // length check
   *responseLength = pn532_packetbuffer[1] - 1;
   if ( (status - 2) != *responseLength) {
-    DMSG("Wrong response length\n");
+    Serial.print("Wrong response length\n");
     return -5;
   }
 
@@ -1117,7 +1291,7 @@ int8_t PN532::felica_SendCommand (const uint8_t *command, uint8_t commandlength,
 int8_t PN532::felica_RequestService(uint8_t numNode, uint16_t *nodeCodeList, uint16_t *keyVersions)
 {
   if (numNode > FELICA_REQ_SERVICE_MAX_NODE_NUM) {
-    DMSG("numNode is too large\n");
+    Serial.print("numNode is too large\n");
     return -1;
   }
 
@@ -1138,13 +1312,13 @@ int8_t PN532::felica_RequestService(uint8_t numNode, uint16_t *nodeCodeList, uin
   uint8_t responseLength;
 
   if (felica_SendCommand(cmd, cmdLen, response, &responseLength) != 1) {
-    DMSG("Request Service command failed\n");
+    Serial.print("Request Service command failed\n");
     return -2;
   }
 
   // length check
   if ( responseLength != 10+2*numNode ) {
-    DMSG("Request Service command failed (wrong response length)\n");
+    Serial.print("Request Service command failed (wrong response length)\n");
     return -3;
   }
 
@@ -1173,13 +1347,13 @@ int8_t PN532::felica_RequestResponse(uint8_t * mode)
   uint8_t response[10];
   uint8_t responseLength;
   if (felica_SendCommand(cmd, 9, response, &responseLength) != 1) {
-    DMSG("Request Response command failed\n");
+    Serial.print("Request Response command failed\n");
     return -1;
   }
 
   // length check
   if ( responseLength != 10) {
-    DMSG("Request Response command failed (wrong response length)\n");
+    Serial.print("Request Response command failed (wrong response length)\n");
     return -2;
   }
 
@@ -1203,11 +1377,11 @@ int8_t PN532::felica_RequestResponse(uint8_t * mode)
 int8_t PN532::felica_ReadWithoutEncryption (uint8_t numService, const uint16_t *serviceCodeList, uint8_t numBlock, const uint16_t *blockList, uint8_t blockData[][16])
 {
   if (numService > FELICA_READ_MAX_SERVICE_NUM) {
-    DMSG("numService is too large\n");
+    Serial.print("numService is too large\n");
     return -1;
   }
   if (numBlock > FELICA_READ_MAX_BLOCK_NUM) {
-    DMSG("numBlock is too large\n");
+    Serial.print("numBlock is too large\n");
     return -2;
   }
 
@@ -1232,22 +1406,22 @@ int8_t PN532::felica_ReadWithoutEncryption (uint8_t numService, const uint16_t *
   uint8_t response[12+16*numBlock];
   uint8_t responseLength;
   if (felica_SendCommand(cmd, cmdLen, response, &responseLength) != 1) {
-    DMSG("Read Without Encryption command failed\n");
+    Serial.print("Read Without Encryption command failed\n");
     return -3;
   }
 
   // length check
   if ( responseLength != 12+16*numBlock ) {
-    DMSG("Read Without Encryption command failed (wrong response length)\n");
+    Serial.print("Read Without Encryption command failed (wrong response length)\n");
     return -4;
   }
 
   // status flag check
   if ( response[9] != 0 || response[10] != 0 ) {
-    DMSG("Read Without Encryption command failed (Status Flag: ");
-    DMSG_HEX(pn532_packetbuffer[9]);
-    DMSG_HEX(pn532_packetbuffer[10]);
-    DMSG(")\n");
+    Serial.print("Read Without Encryption command failed (Status Flag: ");
+    Serial.print(pn532_packetbuffer[9]);
+    Serial.print(pn532_packetbuffer[10]);
+    Serial.print(")\n");
     return -5;
   }
 
@@ -1278,11 +1452,11 @@ int8_t PN532::felica_ReadWithoutEncryption (uint8_t numService, const uint16_t *
 int8_t PN532::felica_WriteWithoutEncryption (uint8_t numService, const uint16_t *serviceCodeList, uint8_t numBlock, const uint16_t *blockList, uint8_t blockData[][16])
 {
   if (numService > FELICA_WRITE_MAX_SERVICE_NUM) {
-    DMSG("numService is too large\n");
+    Serial.print("numService is too large\n");
     return -1;
   }
   if (numBlock > FELICA_WRITE_MAX_BLOCK_NUM) {
-    DMSG("numBlock is too large\n");
+    Serial.print("numBlock is too large\n");
     return -2;
   }
 
@@ -1312,22 +1486,22 @@ int8_t PN532::felica_WriteWithoutEncryption (uint8_t numService, const uint16_t 
   uint8_t response[11];
   uint8_t responseLength;
   if (felica_SendCommand(cmd, cmdLen, response, &responseLength) != 1) {
-    DMSG("Write Without Encryption command failed\n");
+    Serial.print("Write Without Encryption command failed\n");
     return -3;
   }
 
   // length check
   if ( responseLength != 11 ) {
-    DMSG("Write Without Encryption command failed (wrong response length)\n");
+    Serial.print("Write Without Encryption command failed (wrong response length)\n");
     return -4;
   }
 
   // status flag check
   if ( response[9] != 0 || response[10] != 0 ) {
-    DMSG("Write Without Encryption command failed (Status Flag: ");
-    DMSG_HEX(pn532_packetbuffer[9]);
-    DMSG_HEX(pn532_packetbuffer[10]);
-    DMSG(")\n");
+    Serial.print("Write Without Encryption command failed (Status Flag: ");
+    Serial.print(pn532_packetbuffer[9]);
+    Serial.print(pn532_packetbuffer[10]);
+    Serial.print(")\n");
     return -5;
   }
 
@@ -1353,14 +1527,14 @@ int8_t PN532::felica_RequestSystemCode(uint8_t * numSystemCode, uint16_t *system
   uint8_t response[10 + 2 * 16];
   uint8_t responseLength;
   if (felica_SendCommand(cmd, 9, response, &responseLength) != 1) {
-    DMSG("Request System Code command failed\n");
+    Serial.print("Request System Code command failed\n");
     return -1;
   }
   *numSystemCode = response[9];
 
   // length check
   if ( responseLength < 10 + 2 * *numSystemCode ) {
-    DMSG("Request System Code command failed (wrong response length)\n");
+    Serial.print("Request System Code command failed (wrong response length)\n");
     return -2;
   }
 
@@ -1385,25 +1559,25 @@ int8_t PN532::felica_Release()
   // InRelease
   pn532_packetbuffer[0] = PN532_COMMAND_INRELEASE;
   pn532_packetbuffer[1] = 0x00;   // All target
-  DMSG("Release all FeliCa target\n");
+  Serial.print("Release all FeliCa target\n");
 
-  if (HAL(writeCommand)(pn532_packetbuffer, 2)) {
-    DMSG("No ACK\n");
+  if (writeCommand(pn532_packetbuffer, 2)) {
+    Serial.print("No ACK\n");
     return -1;  // no ACK
   }
 
   // Wait card response
-  int16_t frameLength = HAL(readResponse)(pn532_packetbuffer, sizeof(pn532_packetbuffer), 1000);
+  int16_t frameLength = readResponse(pn532_packetbuffer, sizeof(pn532_packetbuffer), 1000);
   if (frameLength < 0) {
-    DMSG("Could not receive response\n");
+    Serial.print("Could not receive response\n");
     return -2;
   }
 
   // Check status (pn532_packetbuffer[0])
   if ((pn532_packetbuffer[0] & 0x3F)!=0) {
-    DMSG("Status code indicates an error: ");
-    DMSG_HEX(pn532_packetbuffer[7]);
-    DMSG("\n");
+    Serial.print("Status code indicates an error: ");
+    Serial.print(pn532_packetbuffer[7]);
+    Serial.print("\n");
     return -3;
   }
 
